@@ -60,7 +60,7 @@ function App() {
 
   return (
     <div className="App">
-      <BrowserRouter>
+      <BrowserRouter basename="/axx">
         <Routes>
           <Route path="/" element={<Landing user={user} />} />
           <Route
