@@ -2,11 +2,10 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Backgrou
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr
 from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -19,32 +18,25 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from database import supabase
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 SECRET_KEY = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
-# Create the main app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Models
 class UserCreate(BaseModel):
     full_name: str
     email: EmailStr
     password: str
-    role: str  # "teacher" or "student"
+    role: str
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -113,7 +105,6 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
 
-# Helper functions
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -134,11 +125,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        
-        user = await db.users.find_one({"id": user_id}, {"_id": 0})
-        if user is None:
+
+        response = supabase.table("users").select("id, full_name, email, role, created_at").eq("id", user_id).execute()
+        if not response.data:
             raise HTTPException(status_code=401, detail="User not found")
-        return user
+        return response.data[0]
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.JWTError:
@@ -159,26 +150,21 @@ async def create_notification(user_id: str, message: str, notification_type: str
         "read": False,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    await db.notifications.insert_one(notification)
+    supabase.table("notifications").insert(notification).execute()
 
-# Routes
 @api_router.get("/")
 async def root():
     return {"message": "Sistema de Gestión Académica API"}
 
-# Auth routes
 @api_router.post("/auth/register")
 async def register(user_data: UserCreate):
-    # Check if user exists
-    existing_user = await db.users.find_one({"email": user_data.email})
-    if existing_user:
+    response = supabase.table("users").select("id").eq("email", user_data.email).execute()
+    if response.data:
         raise HTTPException(status_code=400, detail="El correo ya está registrado")
-    
-    # Validate role
+
     if user_data.role not in ["teacher", "student"]:
         raise HTTPException(status_code=400, detail="Rol inválido")
-    
-    # Create user
+
     user = {
         "id": str(uuid.uuid4()),
         "full_name": user_data.full_name,
@@ -189,12 +175,11 @@ async def register(user_data: UserCreate):
         "reset_token": None,
         "reset_token_expiry": None
     }
-    
-    await db.users.insert_one(user)
-    
-    # Create token
+
+    supabase.table("users").insert(user).execute()
+
     access_token = create_access_token(data={"sub": user["id"]})
-    
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -208,12 +193,13 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin):
-    user = await db.users.find_one({"email": credentials.email})
-    if not user or not verify_password(credentials.password, user["password_hash"]):
+    response = supabase.table("users").select("*").eq("email", credentials.email).execute()
+    if not response.data or not verify_password(credentials.password, response.data[0]["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
-    
+
+    user = response.data[0]
     access_token = create_access_token(data={"sub": user["id"]})
-    
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -227,69 +213,58 @@ async def login(credentials: UserLogin):
 
 @api_router.post("/auth/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest):
-    user = await db.users.find_one({"email": request.email})
-    if not user:
-        # Don't reveal if email exists
+    response = supabase.table("users").select("id").eq("email", request.email).execute()
+    if not response.data:
         return {"message": "Si el correo existe, recibirás un enlace de recuperación"}
-    
-    # Generate reset token
+
+    user = response.data[0]
     reset_token = secrets.token_urlsafe(32)
     reset_token_expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    
-    await db.users.update_one(
-        {"id": user["id"]},
-        {"$set": {"reset_token": reset_token, "reset_token_expiry": reset_token_expiry}}
-    )
-    
-    # In production, send email here
-    # For now, return token for testing
+
+    supabase.table("users").update({
+        "reset_token": reset_token,
+        "reset_token_expiry": reset_token_expiry
+    }).eq("id", user["id"]).execute()
+
     return {
         "message": "Si el correo existe, recibirás un enlace de recuperación",
-        "reset_token": reset_token  # Remove in production
+        "reset_token": reset_token
     }
 
 @api_router.post("/auth/reset-password")
 async def reset_password(request: ResetPasswordRequest):
-    user = await db.users.find_one({"reset_token": request.token})
-    if not user:
+    response = supabase.table("users").select("*").eq("reset_token", request.token).execute()
+    if not response.data:
         raise HTTPException(status_code=400, detail="Token inválido")
-    
-    # Check if token expired
+
+    user = response.data[0]
     if user["reset_token_expiry"]:
         expiry = datetime.fromisoformat(user["reset_token_expiry"])
         if expiry < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Token expirado")
-    
-    # Update password
+
     new_password_hash = hash_password(request.new_password)
-    await db.users.update_one(
-        {"id": user["id"]},
-        {"$set": {"password_hash": new_password_hash, "reset_token": None, "reset_token_expiry": None}}
-    )
-    
+    supabase.table("users").update({
+        "password_hash": new_password_hash,
+        "reset_token": None,
+        "reset_token_expiry": None
+    }).eq("id", user["id"]).execute()
+
     return {"message": "Contraseña actualizada exitosamente"}
 
 @api_router.get("/auth/me", response_model=User)
 async def get_me(current_user: dict = Depends(get_current_user)):
-    return User(
-        id=current_user["id"],
-        full_name=current_user["full_name"],
-        email=current_user["email"],
-        role=current_user["role"],
-        created_at=current_user["created_at"]
-    )
+    return User(**current_user)
 
-# Course routes
 @api_router.post("/courses", response_model=Course)
 async def create_course(course_data: CourseCreate, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes pueden crear cursos")
-    
-    # Check if course code exists
-    existing_course = await db.courses.find_one({"code": course_data.code})
-    if existing_course:
+
+    response = supabase.table("courses").select("id").eq("code", course_data.code).execute()
+    if response.data:
         raise HTTPException(status_code=400, detail="El código del curso ya existe")
-    
+
     course = {
         "id": str(uuid.uuid4()),
         "name": course_data.name,
@@ -300,119 +275,106 @@ async def create_course(course_data: CourseCreate, current_user: dict = Depends(
         "access_code": secrets.token_urlsafe(8),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    
-    await db.courses.insert_one(course)
+
+    supabase.table("courses").insert(course).execute()
     return Course(**course)
 
 @api_router.get("/courses/teacher", response_model=List[Course])
 async def get_teacher_courses(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    courses = await db.courses.find({"teacher_id": current_user["id"]}, {"_id": 0}).to_list(1000)
-    return [Course(**course) for course in courses]
+
+    response = supabase.table("courses").select("*").eq("teacher_id", current_user["id"]).execute()
+    return [Course(**course) for course in response.data]
 
 @api_router.get("/courses/student", response_model=List[Course])
 async def get_student_courses(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "student":
         raise HTTPException(status_code=403, detail="Solo estudiantes")
-    
-    # Get enrollments
-    enrollments = await db.enrollments.find({"student_id": current_user["id"]}, {"_id": 0}).to_list(1000)
-    course_ids = [e["course_id"] for e in enrollments]
-    
-    if not course_ids:
+
+    enrollments = supabase.table("enrollments").select("course_id").eq("student_id", current_user["id"]).execute()
+    if not enrollments.data:
         return []
-    
-    courses = await db.courses.find({"id": {"$in": course_ids}}, {"_id": 0}).to_list(1000)
-    return [Course(**course) for course in courses]
+
+    course_ids = [e["course_id"] for e in enrollments.data]
+    response = supabase.table("courses").select("*").in_("id", course_ids).execute()
+    return [Course(**course) for course in response.data]
 
 @api_router.get("/courses/{course_id}", response_model=Course)
 async def get_course(course_id: str, current_user: dict = Depends(get_current_user)):
-    course = await db.courses.find_one({"id": course_id}, {"_id": 0})
-    if not course:
+    response = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not response.data:
         raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    # Check access
+
+    course = response.data[0]
+
     if current_user["role"] == "teacher":
         if course["teacher_id"] != current_user["id"]:
             raise HTTPException(status_code=403, detail="No autorizado")
     else:
-        enrollment = await db.enrollments.find_one({
-            "student_id": current_user["id"],
-            "course_id": course_id
-        })
-        if not enrollment:
+        enrollment = supabase.table("enrollments").select("id").eq("student_id", current_user["id"]).eq("course_id", course_id).execute()
+        if not enrollment.data:
             raise HTTPException(status_code=403, detail="No inscrito en este curso")
-    
+
     return Course(**course)
 
 @api_router.put("/courses/{course_id}", response_model=Course)
 async def update_course(course_id: str, course_data: CourseCreate, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    course = await db.courses.find_one({"id": course_id})
-    if not course or course["teacher_id"] != current_user["id"]:
+
+    response = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not response.data or response.data[0]["teacher_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    await db.courses.update_one(
-        {"id": course_id},
-        {"$set": {
-            "name": course_data.name,
-            "code": course_data.code,
-            "description": course_data.description,
-            "academic_period": course_data.academic_period
-        }}
-    )
-    
-    updated_course = await db.courses.find_one({"id": course_id}, {"_id": 0})
-    return Course(**updated_course)
+
+    supabase.table("courses").update({
+        "name": course_data.name,
+        "code": course_data.code,
+        "description": course_data.description,
+        "academic_period": course_data.academic_period
+    }).eq("id", course_id).execute()
+
+    updated = supabase.table("courses").select("*").eq("id", course_id).execute()
+    return Course(**updated.data[0])
 
 @api_router.delete("/courses/{course_id}")
 async def delete_course(course_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    course = await db.courses.find_one({"id": course_id})
-    if not course or course["teacher_id"] != current_user["id"]:
+
+    response = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not response.data or response.data[0]["teacher_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    # Delete course, enrollments, and grades
-    await db.courses.delete_one({"id": course_id})
-    await db.enrollments.delete_many({"course_id": course_id})
-    await db.grades.delete_many({"course_id": course_id})
-    
+
+    supabase.table("grades").delete().eq("course_id", course_id).execute()
+    supabase.table("enrollments").delete().eq("course_id", course_id).execute()
+    supabase.table("courses").delete().eq("id", course_id).execute()
+
     return {"message": "Curso eliminado"}
 
 @api_router.post("/courses/enroll")
 async def enroll_in_course(enrollment_data: EnrollmentCreate, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "student":
         raise HTTPException(status_code=403, detail="Solo estudiantes")
-    
-    # Find course by access code
-    course = await db.courses.find_one({"access_code": enrollment_data.access_code})
-    if not course:
+
+    response = supabase.table("courses").select("*").eq("access_code", enrollment_data.access_code).execute()
+    if not response.data:
         raise HTTPException(status_code=404, detail="Código de acceso inválido")
-    
-    # Check if already enrolled
-    existing_enrollment = await db.enrollments.find_one({
-        "student_id": current_user["id"],
-        "course_id": course["id"]
-    })
-    if existing_enrollment:
+
+    course = response.data[0]
+
+    existing = supabase.table("enrollments").select("id").eq("student_id", current_user["id"]).eq("course_id", course["id"]).execute()
+    if existing.data:
         raise HTTPException(status_code=400, detail="Ya estás inscrito en este curso")
-    
-    # Create enrollment
+
     enrollment = {
         "id": str(uuid.uuid4()),
         "student_id": current_user["id"],
         "course_id": course["id"],
         "enrolled_at": datetime.now(timezone.utc).isoformat()
     }
-    await db.enrollments.insert_one(enrollment)
-    
-    # Create initial grade record
+    supabase.table("enrollments").insert(enrollment).execute()
+
     grade = {
         "id": str(uuid.uuid4()),
         "enrollment_id": enrollment["id"],
@@ -425,59 +387,47 @@ async def enroll_in_course(enrollment_data: EnrollmentCreate, current_user: dict
         "final_grade": None,
         "last_updated": datetime.now(timezone.utc).isoformat()
     }
-    await db.grades.insert_one(grade)
-    
+    supabase.table("grades").insert(grade).execute()
+
     return {"message": "Inscripción exitosa", "course": Course(**course)}
 
 @api_router.get("/courses/{course_id}/students")
 async def get_course_students(course_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    course = await db.courses.find_one({"id": course_id})
-    if not course or course["teacher_id"] != current_user["id"]:
-        raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    # Get enrollments
-    enrollments = await db.enrollments.find({"course_id": course_id}, {"_id": 0}).to_list(1000)
-    student_ids = [e["student_id"] for e in enrollments]
-    
-    if not student_ids:
-        return []
-    
-    # Get students
-    students = await db.users.find(
-        {"id": {"$in": student_ids}},
-        {"_id": 0, "password_hash": 0, "reset_token": 0, "reset_token_expiry": 0}
-    ).to_list(1000)
-    
-    return students
 
-# Grade routes
+    response = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not response.data or response.data[0]["teacher_id"] != current_user["id"]:
+        raise HTTPException(status_code=404, detail="Curso no encontrado")
+
+    enrollments = supabase.table("enrollments").select("student_id").eq("course_id", course_id).execute()
+    if not enrollments.data:
+        return []
+
+    student_ids = [e["student_id"] for e in enrollments.data]
+    students = supabase.table("users").select("id, full_name, email, role, created_at").in_("id", student_ids).execute()
+
+    return students.data
+
 @api_router.post("/grades")
 async def create_or_update_grade(grade_data: GradeInput, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    # Validate grades
+
     for grade_value in [grade_data.corte1, grade_data.corte2, grade_data.corte3]:
         if grade_value is not None and (grade_value < 0 or grade_value > 5):
             raise HTTPException(status_code=400, detail="Las notas deben estar entre 0.0 y 5.0")
-    
-    # Get enrollment
-    enrollment = await db.enrollments.find_one({"id": grade_data.enrollment_id})
-    if not enrollment:
+
+    enrollment = supabase.table("enrollments").select("*").eq("id", grade_data.enrollment_id).execute()
+    if not enrollment.data:
         raise HTTPException(status_code=404, detail="Inscripción no encontrada")
-    
-    # Check if teacher owns the course
-    course = await db.courses.find_one({"id": enrollment["course_id"]})
-    if not course or course["teacher_id"] != current_user["id"]:
+
+    course = supabase.table("courses").select("*").eq("id", enrollment.data[0]["course_id"]).execute()
+    if not course.data or course.data[0]["teacher_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="No autorizado")
-    
-    # Get existing grade
-    existing_grade = await db.grades.find_one({"enrollment_id": grade_data.enrollment_id})
-    
-    # Prepare update
+
+    existing_grade = supabase.table("grades").select("*").eq("enrollment_id", grade_data.enrollment_id).execute()
+
     update_data = {"last_updated": datetime.now(timezone.utc).isoformat()}
     if grade_data.corte1 is not None:
         update_data["corte1"] = grade_data.corte1
@@ -485,90 +435,78 @@ async def create_or_update_grade(grade_data: GradeInput, background_tasks: Backg
         update_data["corte2"] = grade_data.corte2
     if grade_data.corte3 is not None:
         update_data["corte3"] = grade_data.corte3
-    
-    # Calculate final grade
-    corte1 = grade_data.corte1 if grade_data.corte1 is not None else existing_grade.get("corte1")
-    corte2 = grade_data.corte2 if grade_data.corte2 is not None else existing_grade.get("corte2")
-    corte3 = grade_data.corte3 if grade_data.corte3 is not None else existing_grade.get("corte3")
-    
+
+    corte1 = grade_data.corte1 if grade_data.corte1 is not None else existing_grade.data[0].get("corte1")
+    corte2 = grade_data.corte2 if grade_data.corte2 is not None else existing_grade.data[0].get("corte2")
+    corte3 = grade_data.corte3 if grade_data.corte3 is not None else existing_grade.data[0].get("corte3")
+
     final_grade = calculate_final_grade(corte1, corte2, corte3)
     if final_grade is not None:
         update_data["final_grade"] = final_grade
-    
-    await db.grades.update_one(
-        {"enrollment_id": grade_data.enrollment_id},
-        {"$set": update_data}
-    )
-    
-    # Create notification for student
+
+    supabase.table("grades").update(update_data).eq("enrollment_id", grade_data.enrollment_id).execute()
+
     background_tasks.add_task(
         create_notification,
-        enrollment["student_id"],
-        f"Nueva calificación registrada en {course['name']}",
+        enrollment.data[0]["student_id"],
+        f"Nueva calificación registrada en {course.data[0]['name']}",
         "grade_update"
     )
-    
-    updated_grade = await db.grades.find_one({"enrollment_id": grade_data.enrollment_id}, {"_id": 0})
-    return Grade(**updated_grade)
+
+    updated_grade = supabase.table("grades").select("*").eq("enrollment_id", grade_data.enrollment_id).execute()
+    return Grade(**updated_grade.data[0])
 
 @api_router.get("/grades/course/{course_id}", response_model=List[Grade])
 async def get_course_grades(course_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    course = await db.courses.find_one({"id": course_id})
-    if not course or course["teacher_id"] != current_user["id"]:
+
+    course = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not course.data or course.data[0]["teacher_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    grades = await db.grades.find({"course_id": course_id}, {"_id": 0}).to_list(1000)
-    return [Grade(**grade) for grade in grades]
+
+    grades = supabase.table("grades").select("*").eq("course_id", course_id).execute()
+    return [Grade(**grade) for grade in grades.data]
 
 @api_router.get("/grades/student/course/{course_id}", response_model=Grade)
 async def get_student_grade(course_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "student":
         raise HTTPException(status_code=403, detail="Solo estudiantes")
-    
-    grade = await db.grades.find_one({
-        "course_id": course_id,
-        "student_id": current_user["id"]
-    }, {"_id": 0})
-    
-    if not grade:
+
+    grade = supabase.table("grades").select("*").eq("course_id", course_id).eq("student_id", current_user["id"]).execute()
+
+    if not grade.data:
         raise HTTPException(status_code=404, detail="Calificación no encontrada")
-    
-    return Grade(**grade)
+
+    return Grade(**grade.data[0])
 
 @api_router.get("/grades/export/{course_id}")
 async def export_grades_pdf(course_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Solo docentes")
-    
-    course = await db.courses.find_one({"id": course_id})
-    if not course or course["teacher_id"] != current_user["id"]:
+
+    course = supabase.table("courses").select("*").eq("id", course_id).execute()
+    if not course.data or course.data[0]["teacher_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Curso no encontrado")
-    
-    grades = await db.grades.find({"course_id": course_id}, {"_id": 0}).to_list(1000)
-    
-    # Create PDF
+
+    grades = supabase.table("grades").select("*").eq("course_id", course_id).execute()
+
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     elements = []
     styles = getSampleStyleSheet()
-    
-    # Title
+
     title = Paragraph(f"<b>Reporte de Calificaciones</b>", styles['Title'])
     elements.append(title)
     elements.append(Spacer(1, 12))
-    
-    # Course info
-    course_info = Paragraph(f"<b>Curso:</b> {course['name']} ({course['code']})<br/><b>Período:</b> {course['academic_period']}", styles['Normal'])
+
+    course_info = Paragraph(f"<b>Curso:</b> {course.data[0]['name']} ({course.data[0]['code']})<br/><b>Período:</b> {course.data[0]['academic_period']}", styles['Normal'])
     elements.append(course_info)
     elements.append(Spacer(1, 12))
-    
-    # Table
+
     data = [['Estudiante', 'Corte 1 (30%)', 'Corte 2 (35%)', 'Corte 3 (35%)', 'Nota Final']]
-    
-    for grade in grades:
+
+    for grade in grades.data:
         row = [
             grade['student_name'],
             str(grade['corte1']) if grade['corte1'] is not None else '-',
@@ -577,7 +515,7 @@ async def export_grades_pdf(course_id: str, current_user: dict = Depends(get_cur
             str(grade['final_grade']) if grade['final_grade'] is not None else '-'
         ]
         data.append(row)
-    
+
     table = Table(data)
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
@@ -589,40 +527,31 @@ async def export_grades_pdf(course_id: str, current_user: dict = Depends(get_cur
         ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
         ('GRID', (0, 0), (-1, -1), 1, colors.black)
     ]))
-    
+
     elements.append(table)
     doc.build(elements)
-    
+
     buffer.seek(0)
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=calificaciones_{course['code']}.pdf"}
+        headers={"Content-Disposition": f"attachment; filename=calificaciones_{course.data[0]['code']}.pdf"}
     )
 
-# Notification routes
 @api_router.get("/notifications", response_model=List[Notification])
 async def get_notifications(current_user: dict = Depends(get_current_user)):
-    notifications = await db.notifications.find(
-        {"user_id": current_user["id"]},
-        {"_id": 0}
-    ).sort("created_at", -1).to_list(100)
-    
-    return [Notification(**notif) for notif in notifications]
+    notifications = supabase.table("notifications").select("*").eq("user_id", current_user["id"]).order("created_at", desc=True).limit(100).execute()
+    return [Notification(**notif) for notif in notifications.data]
 
 @api_router.put("/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: str, current_user: dict = Depends(get_current_user)):
-    result = await db.notifications.update_one(
-        {"id": notification_id, "user_id": current_user["id"]},
-        {"$set": {"read": True}}
-    )
-    
-    if result.matched_count == 0:
+    result = supabase.table("notifications").update({"read": True}).eq("id", notification_id).eq("user_id", current_user["id"]).execute()
+
+    if not result.data:
         raise HTTPException(status_code=404, detail="Notificación no encontrada")
-    
+
     return {"message": "Notificación marcada como leída"}
 
-# Include the router
 app.include_router(api_router)
 
 app.add_middleware(
@@ -638,7 +567,3 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
