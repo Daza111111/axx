@@ -11,7 +11,7 @@ import TeacherDashboard from "@/pages/TeacherDashboard";
 import StudentDashboard from "@/pages/StudentDashboard";
 import { Toaster } from "@/components/ui/sonner";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = 'https://axx-backend-production.up.railway.app';
 const API = `${BACKEND_URL}/api`;
 
 export const api = axios.create({
